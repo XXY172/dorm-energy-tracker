@@ -15,17 +15,16 @@ elif DB_URL.startswith("postgres://"):
 
 engine = create_engine(DB_URL)
 
-# --- 数据库初始化与平滑升级 ---
+# --- 数据库初始化与平滑升级 (修复了事务死锁问题) ---
 def init_db():
-    with engine.begin() as conn:
-        # 1. 创建用户表
+    # 第一步：正常建表（独立事务）
+    with engine.connect() as conn:
         conn.execute(text('''
             CREATE TABLE IF NOT EXISTS users (
                 dorm_id VARCHAR(50) PRIMARY KEY,
                 password VARCHAR(50)
             )
         '''))
-        # 2. 创建记录表（新增了 dorm_id 字段）
         conn.execute(text('''
             CREATE TABLE IF NOT EXISTS records (
                 记录时间 TIMESTAMP,
@@ -36,24 +35,29 @@ def init_db():
                 dorm_id VARCHAR(50)
             )
         '''))
-        # 3. 兼容旧数据的热更新：尝试给已存在的旧表加上 dorm_id 字段
-        try:
+        conn.commit()
+        
+    # 第二步：兼容旧数据字段升级（捕获错误且不影响主事务）
+    try:
+        with engine.connect() as conn:
             conn.execute(text("ALTER TABLE records ADD COLUMN dorm_id VARCHAR(50)"))
             conn.execute(text("UPDATE records SET dorm_id = '默认老寝室' WHERE dorm_id IS NULL"))
-        except Exception:
-            pass # 如果字段已存在会报错，直接忽略即可
+            conn.commit()
+    except Exception:
+        pass # 如果字段已存在会报错，在这里安全忽略
 
 init_db()
 
-# --- 数据库操作函数 (加入 dorm_id 隔离) ---
+# --- 数据库操作函数 ---
 def load_data(dorm_id):
     try:
-        # 只读取当前登录寝室的数据
-        df = pd.read_sql(
-            text("SELECT * FROM records WHERE dorm_id = :dorm_id ORDER BY 记录时间 ASC"), 
-            engine, 
-            params={"dorm_id": dorm_id}
-        )
+        # 传入 engine.connect() 避免直接传入 engine 导致警告
+        with engine.connect() as conn:
+            df = pd.read_sql(
+                text("SELECT * FROM records WHERE dorm_id = :dorm_id ORDER BY 记录时间 ASC"), 
+                conn, 
+                params={"dorm_id": dorm_id}
+            )
         if not df.empty:
             df['记录时间'] = pd.to_datetime(df['记录时间'])
         return df
@@ -72,17 +76,19 @@ def save_record(now_str, new_val, change, type_str, remark, dorm_id):
     df.to_sql('records', engine, if_exists='append', index=False)
 
 def delete_record_db(record_time, dorm_id):
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         conn.execute(text("DELETE FROM records WHERE 记录时间 = :time AND dorm_id = :dorm_id"), 
                      {"time": record_time, "dorm_id": dorm_id})
+        conn.commit()
 
 def update_record_db(old_time, new_val, change, type_str, remark, dorm_id):
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         conn.execute(text("""
             UPDATE records 
             SET 当前剩余电量 = :new_val, 电量变化 = :change, 类型 = :type_str, 备注 = :remark 
             WHERE 记录时间 = :time AND dorm_id = :dorm_id
         """), {"new_val": new_val, "change": change, "type_str": type_str, "remark": remark, "time": old_time, "dorm_id": dorm_id})
+        conn.commit()
 
 # --- 页面基础设置 ---
 st.set_page_config(page_title="寝室电量管家", page_icon="⚡")
@@ -103,11 +109,10 @@ if not st.session_state['logged_in']:
         
         if submit_btn:
             if dorm_input and pwd_input:
-                with engine.begin() as conn:
+                with engine.connect() as conn:
                     result = conn.execute(text("SELECT password FROM users WHERE dorm_id = :dorm_id"), {"dorm_id": dorm_input}).fetchone()
                     
                     if result:
-                        # 寝室已存在，校验密码
                         if result[0] == pwd_input:
                             st.session_state['logged_in'] = True
                             st.session_state['dorm_id'] = dorm_input
@@ -115,21 +120,20 @@ if not st.session_state['logged_in']:
                         else:
                             st.error("密码错误，请重试！")
                     else:
-                        # 寝室不存在，自动注册
                         conn.execute(text("INSERT INTO users (dorm_id, password) VALUES (:dorm_id, :password)"), 
                                      {"dorm_id": dorm_input, "password": pwd_input})
+                        conn.commit()
                         st.session_state['logged_in'] = True
                         st.session_state['dorm_id'] = dorm_input
                         st.success("新寝室注册成功！")
                         st.rerun()
             else:
-                st.warning("寝室号和密码不能为空！")
-    st.stop() # 阻止未登录时渲染后续页面
+                st.warning("⚠️ 寝室号和密码都不能为空！")
+    st.stop() 
 
 # --- 主程序界面 (已登录) ---
 current_dorm = st.session_state['dorm_id']
 
-# 顶部导航栏
 col_top1, col_top2 = st.columns([3, 1])
 with col_top1:
     st.title(f"⚡ {current_dorm} 寝室电量")
@@ -173,7 +177,6 @@ with col1:
     action_type = st.radio("本次操作是：", ["日常打卡 (正常消耗)", "刚充了电费 (增加)"])
 
 with col2:
-    # 不管是日常还是充值，只要求填电表上的当前数字
     new_val = st.number_input("👉 请输入电表上目前显示的度数", min_value=0.0, value=current_elec, step=1.0)
     remark = st.text_input("备注", "日常记录" if "日常" in action_type else "交电费")
     
@@ -181,7 +184,6 @@ with col2:
         change = new_val - current_elec
         current_bj_time = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
         
-        # 智能判断类型
         if "充值" in action_type:
             record_type = "充值"
         else:
@@ -200,13 +202,10 @@ if not df.empty:
     chart_data = df.set_index('记录时间')['当前剩余电量']
     st.line_chart(chart_data)
     
-    # 格式化展示数据
     display_df = df.copy().sort_values('记录时间', ascending=False)
     display_df['记录时间'] = display_df['记录时间'].dt.strftime('%Y-%m-%d %H:%M:%S')
-    # 隐藏 dorm_id 列，不展示给前端
     display_df = display_df.drop(columns=['dorm_id'])
     
-    # 使用带颜色的 dataframe 展示
     st.dataframe(display_df, use_container_width=True)
 else:
     st.info("这个寝室还没有记录哦，在上面填入第一笔数据吧！")
