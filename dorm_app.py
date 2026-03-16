@@ -11,7 +11,7 @@ BJ_TZ = timezone(timedelta(hours=8))
 # --- 数据库配置 ---
 DB_URL = os.getenv("DATABASE_URL", "sqlite:///local_dorm_data.db")
 if DB_URL.startswith("postgres://"):
-    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+    DB_URL = DB_URL.replace("postgres://", "postgresql+pg8000://", 1)
 
 engine = create_engine(DB_URL)
 
