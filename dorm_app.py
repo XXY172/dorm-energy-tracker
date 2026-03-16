@@ -5,12 +5,15 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import create_engine, text
 
 # --- 核心更新 1：强制设定北京时间 ---
-# UTC+8 时区设置，确保无论服务器在哪，取到的都是北京时间
 BJ_TZ = timezone(timedelta(hours=8))
 
 # --- 数据库配置 ---
 DB_URL = os.getenv("DATABASE_URL", "sqlite:///local_dorm_data.db")
-if DB_URL.startswith("postgres://"):
+
+# 严谨地替换数据库驱动前缀，明确告诉 SQLAlchemy 使用 pg8000
+if DB_URL.startswith("postgresql://"):
+    DB_URL = DB_URL.replace("postgresql://", "postgresql+pg8000://", 1)
+elif DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql+pg8000://", 1)
 
 engine = create_engine(DB_URL)
@@ -49,7 +52,6 @@ def save_record(now_str, new_val, change, type_str, remark):
 
 # --- 核心更新 2：新增修改与删除的数据库交互函数 ---
 def delete_record_db(record_time):
-    # 使用 engine.begin() 会自动处理事务提交 (commit)
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM records WHERE 记录时间 = :time"), {"time": record_time})
 
@@ -105,7 +107,6 @@ with col1:
     action_type = st.radio("你想做什么？", ["日常打卡 (更新剩余电量)", "充值电费 (增加电量)"])
 
 with col2:
-    # 核心更新 1 的应用：获取准确的北京时间
     current_bj_time = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     if action_type == "日常打卡 (更新剩余电量)":
@@ -128,16 +129,14 @@ with col2:
 
 st.divider()
 
-# --- 数据管理区 (新增) ---
+# --- 数据管理区 ---
 st.subheader("🛠️ 数据管理")
 
 if not df.empty:
-    # 生成时间列表供用户选择
     time_list = df.sort_values('记录时间', ascending=False)['记录时间'].dt.strftime('%Y-%m-%d %H:%M:%S').tolist()
     selected_time_str = st.selectbox("请选择要修改或删除的记录 (按时间)", time_list)
     
     if selected_time_str:
-        # 获取选中行的数据
         row_idx = df['记录时间'].dt.strftime('%Y-%m-%d %H:%M:%S') == selected_time_str
         row = df[row_idx].iloc[0]
         
@@ -148,13 +147,11 @@ if not df.empty:
                 edit_change = st.number_input("电量变化", value=float(row['电量变化']), key="e_change")
             with col_e2:
                 type_options = ["日常消耗", "异常增加", "充值"]
-                # 兼容旧数据可能存在的其他类型
                 current_type = row['类型'] if row['类型'] in type_options else "日常消耗"
                 edit_type = st.selectbox("记录类型", type_options, index=type_options.index(current_type), key="e_type")
                 edit_remark = st.text_input("备注", value=str(row['备注']), key="e_remark")
                 
             col_btn1, col_btn2 = st.columns(2)
-            # 将字符串时间转换回 datetime 对象，供数据库匹配
             target_time_obj = datetime.strptime(selected_time_str, "%Y-%m-%d %H:%M:%S")
             
             with col_btn1:
@@ -163,7 +160,6 @@ if not df.empty:
                     st.success("修改成功！")
                     st.rerun()
             with col_btn2:
-                # 给删除按钮加上一点视觉警示（在支持的主题下）
                 if st.button("🗑️ 删除该记录", type="primary", use_container_width=True):
                     delete_record_db(target_time_obj)
                     st.warning("记录已删除！")
