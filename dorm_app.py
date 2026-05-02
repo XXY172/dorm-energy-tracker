@@ -195,7 +195,8 @@ with col2:
         change = new_val - current_elec
         current_bj_time = datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
         
-        if "充值" in action_type:
+        # 🐛 修复后的智能判断逻辑
+        if action_type == "刚充了电费 (增加)":
             record_type = "充值"
         else:
             record_type = "日常消耗" if change <= 0 else "异常增加"
