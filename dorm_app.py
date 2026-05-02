@@ -3,17 +3,28 @@ import pandas as pd
 import os
 from datetime import datetime, timezone, timedelta
 from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 
 # --- 核心设置 ---
 BJ_TZ = timezone(timedelta(hours=8))
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///local_dorm_data.db")
 
-if DB_URL.startswith("postgresql://"):
-    DB_URL = DB_URL.replace("postgresql://", "postgresql+pg8000://", 1)
-elif DB_URL.startswith("postgres://"):
-    DB_URL = DB_URL.replace("postgres://", "postgresql+pg8000://", 1)
+# --- 数据库连接优化 ---
+@st.cache_resource
+def get_engine():
+    # 优先使用 Streamlit 官方云的 secrets 配置
+    if "DATABASE_URL" in st.secrets:
+        DB_URL = st.secrets["DATABASE_URL"]
+    else:
+        DB_URL = os.getenv("DATABASE_URL", "sqlite:///local_dorm_data.db")
+    
+    # 修正前缀兼容性（SQLAlchemy 需要 postgresql://）
+    if DB_URL.startswith("postgres://"):
+        DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+        
+    return create_engine(DB_URL, poolclass=NullPool)
 
-engine = create_engine(DB_URL)
+# 全局调用缓存好的引擎
+engine = get_engine()
 
 # --- 数据库初始化与平滑升级 (修复了事务死锁问题) ---
 def init_db():
