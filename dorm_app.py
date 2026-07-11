@@ -7,6 +7,7 @@ from sqlalchemy.pool import NullPool
 
 # --- 核心设置 ---
 BJ_TZ = timezone(timedelta(hours=8))
+DEFAULT_WARNING_THRESHOLD = 20.0
 
 # --- 数据库连接优化 ---
 @st.cache_resource
@@ -33,7 +34,8 @@ def init_db():
         conn.execute(text('''
             CREATE TABLE IF NOT EXISTS users (
                 dorm_id VARCHAR(50) PRIMARY KEY,
-                password VARCHAR(50)
+                password VARCHAR(50),
+                warning_threshold FLOAT DEFAULT 20.0
             )
         '''))
         conn.execute(text('''
@@ -56,6 +58,16 @@ def init_db():
             conn.commit()
     except Exception:
         pass # 如果字段已存在会报错，在这里安全忽略
+
+    # 为已有寝室补充低电量预警阈值。
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE users ADD COLUMN warning_threshold FLOAT DEFAULT 20.0"
+            ))
+            conn.commit()
+    except Exception:
+        pass # 字段已存在时安全忽略
 
 init_db()
 
@@ -101,6 +113,26 @@ def update_record_db(old_time, new_val, change, type_str, remark, dorm_id):
         """), {"new_val": new_val, "change": change, "type_str": type_str, "remark": remark, "time": old_time, "dorm_id": dorm_id})
         conn.commit()
 
+def get_warning_threshold(dorm_id):
+    with engine.connect() as conn:
+        threshold = conn.execute(text("""
+            SELECT warning_threshold FROM users WHERE dorm_id = :dorm_id
+        """), {"dorm_id": dorm_id}).scalar()
+    return DEFAULT_WARNING_THRESHOLD if threshold is None else float(threshold)
+
+def update_warning_threshold(dorm_id, threshold):
+    with engine.connect() as conn:
+        conn.execute(text("""
+            UPDATE users SET warning_threshold = :threshold WHERE dorm_id = :dorm_id
+        """), {"threshold": threshold, "dorm_id": dorm_id})
+        conn.commit()
+
+def estimate_threshold_time(current_elec, threshold, daily_avg, now):
+    """按当前日均耗电量，返回电量降至阈值的预计时间。"""
+    if daily_avg is None or daily_avg <= 0 or current_elec <= threshold:
+        return None
+    return now + timedelta(days=(current_elec - threshold) / daily_avg)
+
 # --- 页面基础设置 ---
 st.set_page_config(page_title="寝室电量管家", page_icon="⚡")
 
@@ -144,6 +176,7 @@ if not st.session_state['logged_in']:
 
 # --- 主程序界面 (已登录) ---
 current_dorm = st.session_state['dorm_id']
+warning_threshold = get_warning_threshold(current_dorm)
 
 col_top1, col_top2 = st.columns([3, 1])
 with col_top1:
@@ -171,12 +204,49 @@ if not df.empty:
             if consumed > 0:
                 daily_avg = consumed / time_diff_days
 
-col_m1, col_m2 = st.columns(2)
+col_m1, col_m2, col_m3 = st.columns(3)
 col_m1.metric(label="🔋 电表当前剩余 (度)", value=f"{current_elec:.2f}")
 if daily_avg is not None:
     col_m2.metric(label="📉 近期日均耗电 (度/天)", value=f"{daily_avg:.2f}")
 else:
     col_m2.metric(label="📉 近期日均耗电 (度/天)", value="暂无数据")
+
+estimated_time = estimate_threshold_time(
+    current_elec, warning_threshold, daily_avg, datetime.now(BJ_TZ)
+)
+if df.empty:
+    col_m3.metric(label=f"⏳ 预计低于 {warning_threshold:.2f} 度", value="等待首条记录")
+elif current_elec <= warning_threshold:
+    col_m3.metric(label=f"⚠️ 低于 {warning_threshold:.2f} 度", value="已低于阈值")
+elif estimated_time is not None:
+    col_m3.metric(
+        label=f"⏳ 预计低于 {warning_threshold:.2f} 度",
+        value=estimated_time.strftime("%m-%d %H:%M")
+    )
+else:
+    col_m3.metric(label=f"⏳ 预计低于 {warning_threshold:.2f} 度", value="等待耗电数据")
+
+if not df.empty and current_elec <= warning_threshold:
+    st.error(f"当前剩余电量已低于你设置的 {warning_threshold:.2f} 度阈值，请及时充值。")
+elif estimated_time is not None:
+    st.info(
+        f"若保持近期 {daily_avg:.2f} 度/天的耗电速度，预计将在 "
+        f"{estimated_time.strftime('%Y-%m-%d %H:%M')} 低于 {warning_threshold:.2f} 度。"
+    )
+
+with st.expander("⚙️ 低电量预警设置"):
+    with st.form("warning_threshold_form"):
+        threshold_input = st.number_input(
+            "预警阈值（度）",
+            min_value=0.0,
+            value=warning_threshold,
+            step=1.0,
+            help="剩余电量预计低于此数值时显示预警。"
+        )
+        if st.form_submit_button("保存阈值"):
+            update_warning_threshold(current_dorm, threshold_input)
+            st.success("低电量预警阈值已保存。")
+            st.rerun()
 
 st.divider()
 
