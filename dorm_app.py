@@ -8,6 +8,7 @@ from sqlalchemy.pool import NullPool
 # --- 核心设置 ---
 BJ_TZ = timezone(timedelta(hours=8))
 DEFAULT_WARNING_THRESHOLD = 20.0
+MAX_REMEMBERED_LOGINS = 5
 
 # --- 数据库连接优化 ---
 @st.cache_resource
@@ -133,6 +134,27 @@ def estimate_threshold_time(current_elec, threshold, daily_avg, now):
         return None
     return now + timedelta(days=(current_elec - threshold) / daily_avg)
 
+def remember_login(dorm_id, password):
+    """在当前浏览器会话中保存最近成功登录的账号。"""
+    remembered_logins = st.session_state.get('remembered_logins', [])
+    remembered_logins = [
+        login for login in remembered_logins if login['dorm_id'] != dorm_id
+    ]
+    st.session_state['remembered_logins'] = (
+        [{'dorm_id': dorm_id, 'password': password}] + remembered_logins
+    )[:MAX_REMEMBERED_LOGINS]
+
+def remove_selected_login():
+    """删除下拉框中选中的已保存账号。"""
+    selected_dorm = st.session_state.get('saved_login_selector')
+    st.session_state['remembered_logins'] = [
+        login for login in st.session_state.get('remembered_logins', [])
+        if login['dorm_id'] != selected_dorm
+    ]
+    st.session_state.pop('saved_login_selector', None)
+    st.session_state.pop('login_dorm_input', None)
+    st.session_state.pop('login_pwd_input', None)
+
 # --- 页面基础设置 ---
 st.set_page_config(page_title="寝室电量管家", page_icon="⚡")
 
@@ -140,14 +162,36 @@ st.set_page_config(page_title="寝室电量管家", page_icon="⚡")
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
     st.session_state['dorm_id'] = None
+if 'remembered_logins' not in st.session_state:
+    st.session_state['remembered_logins'] = []
 
 if not st.session_state['logged_in']:
     st.title("⚡ 寝室电量管家 - 登录")
     st.info("首次登录的寝室号和密码将自动注册为初始账号。")
-    
+
+    remembered_logins = st.session_state['remembered_logins']
+    if remembered_logins:
+        login_options = [login['dorm_id'] for login in remembered_logins]
+        selected_dorm = st.selectbox(
+            "📋 已保存的登录账号",
+            options=login_options,
+            key='saved_login_selector'
+        )
+        selected_login = next(
+            login for login in remembered_logins
+            if login['dorm_id'] == selected_dorm
+        )
+        st.session_state['login_dorm_input'] = selected_login['dorm_id']
+        st.session_state['login_pwd_input'] = selected_login['password']
+
+        st.button(
+            "🗑️ 删除已选账号",
+            use_container_width=True,
+            on_click=remove_selected_login
+        )
     with st.form("login_form"):
-        dorm_input = st.text_input("🏠 你的寝室号 (例如: 301)")
-        pwd_input = st.text_input("🔑 密码", type="password")
+        dorm_input = st.text_input("🏠 你的寝室号 (例如: 301)", key='login_dorm_input')
+        pwd_input = st.text_input("🔑 密码", type="password", key='login_pwd_input')
         submit_btn = st.form_submit_button("进入管家")
         
         if submit_btn:
@@ -157,6 +201,7 @@ if not st.session_state['logged_in']:
                     
                     if result:
                         if result[0] == pwd_input:
+                            remember_login(dorm_input, pwd_input)
                             st.session_state['logged_in'] = True
                             st.session_state['dorm_id'] = dorm_input
                             st.rerun()
@@ -166,6 +211,7 @@ if not st.session_state['logged_in']:
                         conn.execute(text("INSERT INTO users (dorm_id, password) VALUES (:dorm_id, :password)"), 
                                      {"dorm_id": dorm_input, "password": pwd_input})
                         conn.commit()
+                        remember_login(dorm_input, pwd_input)
                         st.session_state['logged_in'] = True
                         st.session_state['dorm_id'] = dorm_input
                         st.success("新寝室注册成功！")
