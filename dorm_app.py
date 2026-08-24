@@ -9,6 +9,9 @@ from sqlalchemy.pool import NullPool
 BJ_TZ = timezone(timedelta(hours=8))
 DEFAULT_WARNING_THRESHOLD = 20.0
 MAX_REMEMBERED_LOGINS = 5
+ROLLING_INTERVALS = 7
+MIN_INTERVAL_DAYS = 0.01
+EXCLUDED_CONSUMPTION_TYPES = {"充值", "异常增加"}
 
 # --- 数据库连接优化 ---
 @st.cache_resource
@@ -128,11 +131,81 @@ def update_warning_threshold(dorm_id, threshold):
         """), {"threshold": threshold, "dorm_id": dorm_id})
         conn.commit()
 
-def estimate_threshold_time(current_elec, threshold, daily_avg, now):
-    """按当前日均耗电量，返回电量降至阈值的预计时间。"""
-    if daily_avg is None or daily_avg <= 0 or current_elec <= threshold:
+def calculate_consumption_stats(df):
+    """根据最近多个有效区间，计算稳健的日均耗电速度和预测范围。"""
+    if df.empty or len(df) < 2:
         return None
-    return now + timedelta(days=(current_elec - threshold) / daily_avg)
+
+    records = df.sort_values('记录时间').reset_index(drop=True)
+    rates = []
+    for index in range(1, len(records)):
+        previous = records.iloc[index - 1]
+        current = records.iloc[index]
+        time_diff_days = (
+            current['记录时间'] - previous['记录时间']
+        ).total_seconds() / (24 * 3600)
+
+        # 充值/异常增加记录不参与耗电速度计算；充值后的下一段仍可正常统计。
+        if (
+            time_diff_days <= MIN_INTERVAL_DAYS
+            or current['类型'] in EXCLUDED_CONSUMPTION_TYPES
+        ):
+            continue
+
+        consumed = previous['当前剩余电量'] - current['当前剩余电量']
+        if consumed > 0:
+            rates.append(consumed / time_diff_days)
+
+    if not rates:
+        return None
+
+    rolling_rates = pd.Series(rates[-ROLLING_INTERVALS:], dtype='float64')
+
+    # IQR 过滤异常值；样本太少时保留全部数据，避免误删正常记录。
+    if len(rolling_rates) >= 4:
+        q1 = rolling_rates.quantile(0.25)
+        q3 = rolling_rates.quantile(0.75)
+        iqr = q3 - q1
+        if iqr > 0:
+            lower_bound = max(0.0, q1 - 1.5 * iqr)
+            upper_bound = q3 + 1.5 * iqr
+            filtered_rates = rolling_rates[
+                (rolling_rates >= lower_bound) & (rolling_rates <= upper_bound)
+            ]
+        else:
+            filtered_rates = rolling_rates
+    else:
+        filtered_rates = rolling_rates
+
+    if filtered_rates.empty:
+        filtered_rates = rolling_rates
+
+    return {
+        'daily_avg': float(filtered_rates.median()),
+        'daily_low': float(filtered_rates.quantile(0.25)),
+        'daily_high': float(filtered_rates.quantile(0.75)),
+        'sample_count': len(filtered_rates),
+        'raw_sample_count': len(rolling_rates),
+    }
+
+def estimate_threshold_range(current_elec, threshold, stats, now):
+    """返回中位数预测时间，以及按耗电速度四分位数计算的时间范围。"""
+    if not stats or current_elec <= threshold:
+        return None
+
+    remaining_elec = current_elec - threshold
+    daily_avg = stats['daily_avg']
+    daily_low = stats['daily_low']
+    daily_high = stats['daily_high']
+    if min(daily_avg, daily_low, daily_high) <= 0:
+        return None
+
+    return {
+        'estimated': now + timedelta(days=remaining_elec / daily_avg),
+        # 耗电越快，达到阈值越早，因此时间范围需要反向使用速度分位数。
+        'earliest': now + timedelta(days=remaining_elec / daily_high),
+        'latest': now + timedelta(days=remaining_elec / daily_low),
+    }
 
 def remember_login(dorm_id, password):
     """在当前浏览器会话中保存最近成功登录的账号。"""
@@ -236,48 +309,53 @@ with col_top2:
 df = load_data(current_dorm)
 
 current_elec = 0.0
-daily_avg = None
+consumption_stats = None
 
 if not df.empty:
     current_elec = float(df['当前剩余电量'].iloc[-1])
-    if len(df) >= 2:
-        last_record = df.iloc[-1]
-        prev_record = df.iloc[-2]
-        time_diff_days = (last_record['记录时间'] - prev_record['记录时间']).total_seconds() / (24 * 3600)
-        
-        if time_diff_days > 0.01 and last_record['类型'] != '充值':
-            consumed = prev_record['当前剩余电量'] - last_record['当前剩余电量']
-            if consumed > 0:
-                daily_avg = consumed / time_diff_days
+    consumption_stats = calculate_consumption_stats(df)
 
 col_m1, col_m2, col_m3 = st.columns(3)
 col_m1.metric(label="🔋 电表当前剩余 (度)", value=f"{current_elec:.2f}")
-if daily_avg is not None:
-    col_m2.metric(label="📉 近期日均耗电 (度/天)", value=f"{daily_avg:.2f}")
+if consumption_stats is not None:
+    col_m2.metric(
+        label="📉 稳健日均耗电 (度/天)",
+        value=f"{consumption_stats['daily_avg']:.2f}"
+    )
 else:
-    col_m2.metric(label="📉 近期日均耗电 (度/天)", value="暂无数据")
+    col_m2.metric(label="📉 稳健日均耗电 (度/天)", value="暂无数据")
 
-estimated_time = estimate_threshold_time(
-    current_elec, warning_threshold, daily_avg, datetime.now(BJ_TZ)
+forecast = estimate_threshold_range(
+    current_elec,
+    warning_threshold,
+    consumption_stats,
+    datetime.now(BJ_TZ)
 )
 if df.empty:
     col_m3.metric(label=f"⏳ 预计低于 {warning_threshold:.2f} 度", value="等待首条记录")
 elif current_elec <= warning_threshold:
     col_m3.metric(label=f"⚠️ 低于 {warning_threshold:.2f} 度", value="已低于阈值")
-elif estimated_time is not None:
+elif forecast is not None:
     col_m3.metric(
         label=f"⏳ 预计低于 {warning_threshold:.2f} 度",
-        value=estimated_time.strftime("%m-%d %H:%M")
+        value=forecast['estimated'].strftime("%m-%d %H:%M")
     )
 else:
-    col_m3.metric(label=f"⏳ 预计低于 {warning_threshold:.2f} 度", value="等待耗电数据")
+    col_m3.metric(label=f"⏳ 预计低于 {warning_threshold:.2f} 度", value="等待更多数据")
 
 if not df.empty and current_elec <= warning_threshold:
     st.error(f"当前剩余电量已低于你设置的 {warning_threshold:.2f} 度阈值，请及时充值。")
-elif estimated_time is not None:
+elif forecast is not None:
+    sample_text = (
+        f"基于最近 {consumption_stats['raw_sample_count']} 个耗电区间，"
+        f"过滤异常值后保留 {consumption_stats['sample_count']} 个区间。"
+    )
     st.info(
-        f"若保持近期 {daily_avg:.2f} 度/天的耗电速度，预计将在 "
-        f"{estimated_time.strftime('%Y-%m-%d %H:%M')} 低于 {warning_threshold:.2f} 度。"
+        f"{sample_text}按中位数速度预计将在 "
+        f"{forecast['estimated'].strftime('%Y-%m-%d %H:%M')} "
+        f"低于 {warning_threshold:.2f} 度；预计范围为 "
+        f"{forecast['earliest'].strftime('%m-%d %H:%M')} 至 "
+        f"{forecast['latest'].strftime('%m-%d %H:%M')}。"
     )
 
 with st.expander("⚙️ 低电量预警设置"):
